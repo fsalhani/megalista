@@ -50,11 +50,20 @@ class GoogleAdsECLeadsUploaderDoFn(MegalistaUploader):
 
     def _get_customer_id(self, account_config: AccountConfig, destination: Destination) -> str:
         """
-          If the customer_id is present on the destination, returns it, otherwise defaults to the account_config info.
+            If the customer_id is present on the destination, returns it, otherwise defaults to the account_config info.
         """
         if len(destination.destination_metadata) >= 2 and len(destination.destination_metadata[1]) > 0:
             return destination.destination_metadata[1].replace('-', '')
         return account_config.google_ads_account_id.replace('-', '')
+
+    def _get_login_customer_id(self, account_config: AccountConfig, destination: Destination) -> str:
+        """
+            If the customer_id in account_config is a mcc, then login with the mcc account id, otherwise use the customer id.
+        """
+        if account_config._mcc:
+            return account_config.google_ads_account_id.replace('-', '')
+
+        return self._get_customer_id(account_config, destination)
 
     @staticmethod
     def _assert_conversion_name_is_present(execution: Execution):
@@ -75,12 +84,19 @@ class GoogleAdsECLeadsUploaderDoFn(MegalistaUploader):
 
         customer_id = self._get_customer_id(
             execution.account_config, execution.destination)
-        oc_service = self._get_oc_service(customer_id)
+        # Retrieves the login-customer-id if mcc enabled
+        login_customer_id = self._get_login_customer_id(
+            execution.account_config, execution.destination)
+        # Initiates OCI service
+        oc_service = self._get_oc_service(login_customer_id)
+        # Initiates ADS service
+        ads_service = self._get_ads_service(login_customer_id)
+        # Asserts Ads is set up for EC for Leads
+        self._assert_ec_for_leads_enabled(
+            ads_service, customer_id)
 
-        self._assert_ec_for_leads_enabled(customer_id)  # jraucci
-
-        resource_name = self._get_resource_name(
-            customer_id, execution.destination.destination_metadata[0])
+        resource_name = self._get_resource_name(ads_service,
+                                                customer_id, execution.destination.destination_metadata[0])
 
         response = self._do_upload(oc_service,
                                    execution,
@@ -88,8 +104,12 @@ class GoogleAdsECLeadsUploaderDoFn(MegalistaUploader):
                                    customer_id,
                                    batch.elements)
 
+        print("Response:  ", response)
+
         successful_users = [
             user for user in response.results if user.ListFields()]
+
+        print("sucess:  ", successful_users)
 
         logging.getLogger(_DEFAULT_LOGGER).info(
             f'Sucessfully uploaded {len(successful_users)} conversions')
@@ -120,10 +140,9 @@ class GoogleAdsECLeadsUploaderDoFn(MegalistaUploader):
 
         return response
 
-    def _get_resource_name(self, customer_id: str, name: str):
-        service = self._get_ads_service(customer_id)
+    def _get_resource_name(self, ads_service, customer_id: str, name: str):
         query = f"SELECT conversion_action.resource_name FROM conversion_action WHERE conversion_action.name = '{name}'"
-        response_query = service.search_stream(
+        response_query = ads_service.search_stream(
             customer_id=customer_id, query=query)
         for batch in response_query:
             for row in batch.results:
@@ -131,10 +150,9 @@ class GoogleAdsECLeadsUploaderDoFn(MegalistaUploader):
         raise Exception(
             f'Conversion "{name}" could not be found on account {customer_id}')
 
-    def _assert_ec_for_leads_enabled(self, customer_id: str):
-        service = self._get_ads_service(customer_id)
+    def _assert_ec_for_leads_enabled(self, ads_service, customer_id: str):
         query = f"SELECT customer.id, customer.conversion_tracking_setting.accepted_customer_data_terms, customer.conversion_tracking_setting.enhanced_conversions_for_leads_enabled FROM customer"
-        response_query = service.search_stream(
+        response_query = ads_service.search_stream(
             customer_id=customer_id, query=query)
         for batch in response_query:
             for row in batch.results:
@@ -143,5 +161,5 @@ class GoogleAdsECLeadsUploaderDoFn(MegalistaUploader):
                     return
                 else:
                     raise Exception(
-                        f'Google Ads has not been set up for Enhanced Conversions for Leads, check https://developers.google.com/google-ads/api/docs/conversions/upload-identifiers'
+                        f'Google Ads for account {customer_id} has not been set up for Enhanced Conversions for Leads, check https://developers.google.com/google-ads/api/docs/conversions/upload-identifiers'
                     )
